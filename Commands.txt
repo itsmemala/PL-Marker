@@ -1,0 +1,17 @@
+For run_acener.py (direct evaluate):
+python  run_acener.py  --model_type bertspanmarker  --model_name_or_path  allenai/scibert_scivocab_uncased  --do_lower_case  --data_dir scierc  --learning_rate 2e-5  --num_train_epochs 50  --per_gpu_train_batch_size  8  --per_gpu_eval_batch_size 16  --gradient_accumulation_steps 1  --max_seq_length 512  --save_steps 2000  --max_pair_length 256  --max_mention_ori_length 8    --do_eval  --evaluate_during_training   --eval_all_checkpoints  --fp16  --seed 42  --onedropout  --lminit  --train_file train.json --dev_file dev.json --test_file test.json  --output_dir models/sciner-scibert  --overwrite_output_dir  --output_results
+
+For run_acener.py (predict using sentences only):
+python  run_acener.py  --model_type bertspanmarker  --model_name_or_path  allenai/scibert_scivocab_uncased  --do_lower_case  --data_dir scierc  --learning_rate 2e-5  --num_train_epochs 50  --per_gpu_train_batch_size  8  --per_gpu_eval_batch_size 16  --gradient_accumulation_steps 1  --max_seq_length 512  --save_steps 2000  --max_pair_length 256  --max_mention_ori_length 8  --do_pred  --evaluate_during_training   --eval_all_checkpoints  --fp16  --seed 42  --onedropout  --lminit  --train_file train.json --dev_file dev.json --test_file test_sentences.json  --output_dir models/sciner-scibert  --overwrite_output_dir  --output_results
+
+For run_acener.py (predict iccbr using sentences only):
+python  run_acener.py  --model_type bertspanmarker  --model_name_or_path  allenai/scibert_scivocab_uncased  --do_lower_case  --data_dir scierc  --learning_rate 2e-5  --num_train_epochs 50  --per_gpu_train_batch_size  8  --per_gpu_eval_batch_size 16  --gradient_accumulation_steps 1  --max_seq_length 512  --save_steps 2000  --max_pair_length 256  --max_mention_ori_length 8  --do_pred  --evaluate_during_training   --eval_all_checkpoints  --fp16  --seed 42  --onedropout  --lminit  --test_file iccbr_test_sentences.json  --output_dir models/sciner-scibert  --overwrite_output_dir  --output_results
+
+----------------------------------------------------------------
+
+For run_re.py (direct evaluate using run_acener.py output file):
+python  run_re.py  --model_type bertsub  --model_name_or_path  allenai/scibert_scivocab_uncased  --do_lower_case  --data_dir scierc  --learning_rate 2e-5  --num_train_epochs 10  --per_gpu_train_batch_size  8  --per_gpu_eval_batch_size 16  --gradient_accumulation_steps 1  --max_seq_length 256  --max_pair_length 16  --save_steps 2500  --do_eval  --evaluate_during_training   --eval_all_checkpoints  --eval_logsoftmax  --fp16  --lminit   --test_file models/sciner-scibert/run_acener_py_ent_pred_test.json  --use_ner_results --output_dir models/scire-scibert
+
+For run_re.py (predict iccbr using run_acener.py output file):
+python  run_re.py  --model_type bertsub  --model_name_or_path  allenai/scibert_scivocab_uncased  --do_lower_case  --data_dir scierc  --learning_rate 2e-5  --num_train_epochs 10  --per_gpu_train_batch_size  8  --per_gpu_eval_batch_size 16  --gradient_accumulation_steps 1  --max_seq_length 256  --max_pair_length 16  --save_steps 2500  --do_pred  --evaluate_during_training   --eval_all_checkpoints  --eval_logsoftmax  --fp16  --lminit   --test_file models/sciner-scibert/ent_pred_test.json  --use_ner_results --output_dir models/scire-scibert
+

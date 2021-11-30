@@ -88,8 +88,10 @@ MODEL_CLASSES = {
 
 
 class ACEDatasetNER(Dataset):
-    def __init__(self, tokenizer, args=None, evaluate=False, do_test=False):
-        if not evaluate:
+    def __init__(self, tokenizer, args=None, evaluate=False, do_test=False, do_pred=False):
+        if do_pred:
+            file_path = os.path.join(args.data_dir, args.test_file)
+        elif not evaluate:
             file_path = os.path.join(args.data_dir, args.train_file)
         else:
             if do_test:
@@ -119,7 +121,7 @@ class ACEDatasetNER(Dataset):
         self.max_pair_length = args.max_pair_length
 
         self.max_entity_length = args.max_pair_length * 2
-        self.initialize()
+        self.initialize(do_pred=do_pred)
 
     def is_punctuation(self, char):
         # obtained from:
@@ -146,7 +148,7 @@ class ACEDatasetNER(Dataset):
         return token
         
     
-    def initialize(self):
+    def initialize(self, do_pred=False):
         tokenizer = self.tokenizer
         max_num_subwords = self.max_seq_length - 2
 
@@ -181,8 +183,11 @@ class ACEDatasetNER(Dataset):
             for i in range(len(sentences)):
                 for j in range(len(sentences[i])):
                     sentences[i][j] = self.get_original_token(sentences[i][j])
-            
-            ners = data['ner']
+            if do_pred:
+                temp_ner = np.array([0,0,'Generic'],dtype=object)
+                ners = np.full((len(sentences),1,3),temp_ner)
+            else:
+                ners = data['ner']
 
             sentence_boundaries = [0]
             words = []
@@ -782,6 +787,134 @@ def evaluate(args, model, tokenizer, prefix="", do_test=False):
 
     return results
 
+def predict(args, model, tokenizer, prefix=""):
+
+    pred_output_dir = args.output_dir
+
+    pred_dataset = ACEDatasetNER(tokenizer=tokenizer, args=args, evaluate=True, do_test=False, do_pred=True)
+
+    if not os.path.exists(pred_output_dir) and args.local_rank in [-1, 0]:
+        os.makedirs(pred_output_dir)
+
+    args.pred_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
+
+    pred_sampler = SequentialSampler(pred_dataset) 
+
+    pred_dataloader = DataLoader(pred_dataset, sampler=pred_sampler, batch_size=args.pred_batch_size,  collate_fn=ACEDatasetNER.collate_fn, num_workers=4*int(args.output_dir.find('test')==-1))
+
+    # Predict!
+    logger.info("***** Running prediction {} *****".format(prefix))
+    logger.info("  Num examples = %d", len(pred_dataset))
+    logger.info("  Batch size = %d", args.pred_batch_size)
+
+    scores = defaultdict(dict)
+    predict_ners = defaultdict(list)
+
+    # model.eval()
+
+    start_time = timeit.default_timer() 
+
+    for batch in tqdm(pred_dataloader, desc="Predicting"):
+        indexs = batch[-2]
+        batch_m2s = batch[-1]
+
+        batch = tuple(t.to(args.device) for t in batch[:-2])
+
+        with torch.no_grad():
+            inputs = {'input_ids':      batch[0],
+                      'attention_mask': batch[1],
+                      'position_ids':   batch[2],
+                    #   'labels':         batch[3]
+                      }
+
+            if args.model_type.find('span')!=-1:
+                inputs['mention_pos'] = batch[4]
+            if args.use_full_layer!=-1:
+                inputs['full_attention_mask']= batch[5]
+
+            outputs = model(**inputs)
+
+            ner_logits = outputs[0]
+            ner_logits = torch.nn.functional.softmax(ner_logits, dim=-1)
+            ner_values, ner_preds = torch.max(ner_logits, dim=-1)
+
+            for i in range(len(indexs)):
+                index = indexs[i]
+                m2s = batch_m2s[i]
+                for j in range(len(m2s)):
+                    obj = m2s[j]
+                    ner_label = pred_dataset.ner_label_list[ner_preds[i,j]]
+                    if ner_label!='NIL':
+                        scores[(index[0], index[1])][(obj[0], obj[1])] = (float(ner_values[i,j]), ner_label)
+
+    cor = 0 
+    tot_pred = 0
+    cor_tot = 0
+    tot_pred_tot = 0
+
+    for example_index, pair_dict in scores.items():  
+
+        sentence_results = []
+        for k1, (v2_score, v2_ner_label) in pair_dict.items():
+            if v2_ner_label!='NIL':
+                sentence_results.append((v2_score, k1, v2_ner_label))
+
+        sentence_results.sort(key=lambda x: -x[0])
+        no_overlap = []
+        def is_overlap(m1, m2):
+            if m2[0]<=m1[0] and m1[0]<=m2[1]:
+                return True
+            if m1[0]<=m2[0] and m2[0]<=m1[1]:
+                return True
+            return False
+
+        for item in sentence_results:
+            m2 = item[1]
+            overlap = False
+            for x in no_overlap:
+                _m2 = x[1]
+                if (is_overlap(m2, _m2)):
+                    if args.data_dir.find('ontonotes')!=-1:
+                        overlap = True
+                        break
+                    else:
+                    
+                        if item[2]==x[2]:
+                            overlap = True
+                            break
+
+            if not overlap:
+                no_overlap.append(item)
+
+            pred_ner_label = item[2]
+
+        for item in no_overlap:
+            m2 = item[1]
+            pred_ner_label = item[2]
+            tot_pred += 1
+            if args.output_results:
+                predict_ners[example_index].append( (m2[0], m2[1], pred_ner_label) )       
+
+    predTime = timeit.default_timer() - start_time
+    logger.info("  Prediction done in total %f secs (%f example per second)", predTime,  len(pred_dataset) / predTime)
+
+    if args.output_results:
+        f = open(pred_dataset.file_path)
+        output_w = open(os.path.join(args.output_dir, 'ent_pred_test.json'), 'w')  
+        for l_idx, line in enumerate(f):
+            data = json.loads(line)
+            num_sents = len(data['sentences'])
+            predicted_ner = []
+            for n in range(num_sents):
+                item = predict_ners.get((l_idx, n), [])
+                item.sort()
+                predicted_ner.append( item )
+
+            data['predicted_ner'] = predicted_ner
+            output_w.write(json.dumps(data)+'\n')
+
+    return
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -812,6 +945,8 @@ def main():
                         help="Whether to run eval on the dev set.")
     parser.add_argument("--do_test", action='store_true',
                         help="Whether to run test on the dev set.")
+    parser.add_argument("--do_pred", action='store_true',
+                        help="Whether to run prediction on the test set.")
 
     parser.add_argument("--evaluate_during_training", action='store_true',
                         help="Rul evaluation during training at each logging step.")
@@ -1073,6 +1208,28 @@ def main():
     if args.local_rank in [-1, 0]:
         output_eval_file = os.path.join(args.output_dir, "results.json")
         json.dump(results, open(output_eval_file, "w"))
+
+    # Prediction (no evaluation)
+    if args.do_pred:
+        checkpoints = [args.output_dir]
+
+
+        WEIGHTS_NAME = 'pytorch_model.bin'
+
+        if args.eval_all_checkpoints:
+            checkpoints = list(os.path.dirname(c) for c in sorted(glob.glob(args.output_dir + '/**/' + WEIGHTS_NAME, recursive=True)))
+
+        logger.info("Predict on test set")
+
+        logger.info("Predict using the following checkpoints: %s", checkpoints)
+        for checkpoint in checkpoints:
+            global_step = checkpoint.split('-')[-1] if len(checkpoints) > 1 else ""
+
+
+            model = model_class.from_pretrained(checkpoint, config=config)
+
+            model.to(args.device)
+            predict(args, model, tokenizer, prefix=global_step)
 
 if __name__ == "__main__":
     main()

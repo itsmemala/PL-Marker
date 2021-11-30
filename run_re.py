@@ -85,12 +85,14 @@ task_rel_labels = {
 
 
 class ACEDataset(Dataset):
-    def __init__(self, tokenizer, args=None, evaluate=False, do_test=False, max_pair_length=None):
+    def __init__(self, tokenizer, args=None, evaluate=False, do_test=False, max_pair_length=None, do_pred=False):
 
         if not evaluate:
             file_path = os.path.join(args.data_dir, args.train_file)
         else:
-            if do_test:
+            if do_pred:
+                file_path = args.test_file
+            elif do_test:
                 if args.test_file.find('models')==-1:
                     file_path = os.path.join(args.data_dir, args.test_file)
                 else:
@@ -157,9 +159,9 @@ class ACEDataset(Dataset):
             assert (False)  
 
         self.global_predicted_ners = {}
-        self.initialize()
+        self.initialize(do_pred=do_pred)
  
-    def initialize(self):
+    def initialize(self, do_pred=False):
         tokenizer = self.tokenizer
         vocab_size = tokenizer.vocab_size
         max_num_subwords = self.max_seq_length - 4  # for two marker
@@ -197,9 +199,14 @@ class ACEDataset(Dataset):
             else:
                ners = data['ner']
 
-            std_ners = data['ner']
-
-            relations = data['relations']
+            if do_pred:
+                temp_ner = np.array([0,0,'Generic'],dtype=object)
+                std_ners = np.full((len(sentences),1,3),temp_ner)
+                temp_rel = np.array([0,0,0,0,'COMPARE'],dtype=object)
+                relations = np.full((len(sentences),1,5),temp_rel)
+            else:
+                std_ners = data['ner']
+                relations = data['relations']
 
             for sentence_relation in relations:
                 for x in sentence_relation:
@@ -1003,7 +1010,250 @@ def evaluate(args, model, tokenizer, prefix="", do_test=False):
 
     return results
 
+def predict(args, model, tokenizer, prefix=""):
 
+    pred_output_dir = args.output_dir
+
+    pred_dataset = ACEDataset(tokenizer=tokenizer, args=args, evaluate=True, do_test=False, max_pair_length=args.max_pair_length, do_pred=True)
+    # golden_labels = set(eval_dataset.golden_labels)
+    # golden_labels_withner = set(eval_dataset.golden_labels_withner)
+    label_list = list(pred_dataset.label_list)
+    sym_labels = list(pred_dataset.sym_labels)
+    # tot_recall = eval_dataset.tot_recall
+
+    if not os.path.exists(pred_output_dir) and args.local_rank in [-1, 0]:
+        os.makedirs(pred_output_dir)
+
+    args.pred_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
+
+
+    scores = defaultdict(dict)
+    predict_rel = defaultdict(list)
+    # ner_pred = not args.model_type.endswith('noner')
+    example_subs = set([])
+    num_label = len(label_list)
+
+    logger.info("***** Running prediction {} *****".format(prefix))
+    logger.info("  Batch size = %d", args.pred_batch_size)
+
+    # model.eval()
+
+    pred_sampler = SequentialSampler(pred_dataset) 
+    pred_dataloader = DataLoader(pred_dataset, sampler=pred_sampler, batch_size=args.pred_batch_size,  collate_fn=ACEDataset.collate_fn, num_workers=4*int(args.output_dir.find('test')==-1))
+
+    # Predict!
+    logger.info("  Num examples = %d", len(pred_dataset))
+
+    start_time = timeit.default_timer() 
+
+    for batch in tqdm(pred_dataloader, desc="Predicting"):
+        indexs = batch[-3]
+        subs = batch[-2]
+        batch_m2s = batch[-1]
+        ner_labels = batch[6]
+
+        batch = tuple(t.to(args.device) for t in batch[:-3])
+
+        with torch.no_grad():
+            inputs = {'input_ids':      batch[0],
+                    'attention_mask': batch[1],
+                    'position_ids':   batch[2],
+                    #   'labels':         batch[4],
+                    #   'ner_labels':     batch[5],
+                    }
+
+            inputs['sub_positions'] = batch[3]
+            if args.model_type.find('span')!=-1:
+                inputs['mention_pos'] = batch[4]
+
+            outputs = model(**inputs)
+
+            logits = outputs[0]
+
+            if args.eval_logsoftmax:  # perform a bit better
+                logits = torch.nn.functional.log_softmax(logits, dim=-1)
+
+            elif args.eval_softmax:
+                logits = torch.nn.functional.softmax(logits, dim=-1)
+
+            if args.use_ner_results or args.model_type.endswith('nonersub'):                 
+                ner_preds = ner_labels
+            else:
+                ner_preds = torch.argmax(outputs[1], dim=-1)
+            logits = logits.cpu().numpy()
+            ner_preds = ner_preds.cpu().numpy()
+            for i in range(len(indexs)):
+                index = indexs[i]
+                sub = subs[i]
+                m2s = batch_m2s[i]
+                example_subs.add(((index[0], index[1]), (sub[0], sub[1])))
+                for j in range(len(m2s)):
+                    obj = m2s[j]
+                    ner_label = pred_dataset.ner_label_list[ner_preds[i,j]]
+                    scores[(index[0], index[1])][( (sub[0], sub[1]), (obj[0], obj[1]))] = (logits[i, j].tolist(), ner_label)
+            
+    # cor = 0 
+    # tot_pred = 0
+    # cor_with_ner = 0
+    global_predicted_ners = pred_dataset.global_predicted_ners
+    # ner_golden_labels = eval_dataset.ner_golden_labels
+    # ner_cor = 0 
+    # ner_tot_pred = 0
+    # ner_ori_cor = 0
+
+    if not args.eval_unidirect:     # eval_unidrect is for ablation study
+        for example_index, pair_dict in sorted(scores.items(), key=lambda x:x[0]):  
+            visited  = set([])
+            sentence_results = []
+            for k1, (v1, v2_ner_label) in pair_dict.items():
+                
+                if k1 in visited:
+                    continue
+                visited.add(k1)
+
+                if v2_ner_label=='NIL':
+                    continue
+                v1 = list(v1)
+                m1 = k1[0]
+                m2 = k1[1]
+                if m1 == m2:
+                    continue
+                k2 = (m2, m1)
+                v2s = pair_dict.get(k2, None)
+                if v2s is not None:
+                    visited.add(k2)
+                    v2, v1_ner_label = v2s
+                    v2 = v2[ : len(sym_labels)] + v2[num_label:] + v2[len(sym_labels) : num_label]
+
+                    for j in range(len(v2)):
+                        v1[j] += v2[j]
+                else:
+                    assert ( False )
+
+                if v1_ner_label=='NIL':
+                    continue
+
+                pred_label = np.argmax(v1)
+                if pred_label>0:
+                    if pred_label >= num_label:
+                        pred_label = pred_label - num_label + len(sym_labels)
+                        m1, m2 = m2, m1
+                        v1_ner_label, v2_ner_label = v2_ner_label, v1_ner_label
+
+                    pred_score = v1[pred_label]
+
+                    sentence_results.append( (pred_score, m1, m2, pred_label, v1_ner_label, v2_ner_label) )
+
+            sentence_results.sort(key=lambda x: -x[0])
+            no_overlap = []
+            def is_overlap(m1, m2):
+                if m2[0]<=m1[0] and m1[0]<=m2[1]:
+                    return True
+                if m1[0]<=m2[0] and m2[0]<=m1[1]:
+                    return True
+                return False
+
+            output_preds = []
+
+            for item in sentence_results:
+                m1 = item[1]
+                m2 = item[2]
+                overlap = False
+                for x in no_overlap:
+                    _m1 = x[1]
+                    _m2 = x[2]
+                    # same relation type & overlap subject & overlap object --> delete
+                    if item[3]==x[3] and (is_overlap(m1, _m1) and is_overlap(m2, _m2)):
+                        overlap = True
+                        break
+
+                pred_label = label_list[item[3]]
+
+                output_preds.append((m1, m2, pred_label))
+
+                if not overlap:
+                    no_overlap.append(item)
+
+            for item in no_overlap:
+                m1 = item[1]
+                m2 = item[2]
+                pred_rel_label = label_list[item[3]]
+                predict_rel[example_index].append( (m1[0], m1[1], m2[0], m2[1], pred_rel_label) )
+        
+    else:
+
+        for example_index, pair_dict in sorted(scores.items(), key=lambda x:x[0]):  
+            sentence_results = []
+            for k1, (v1, v2_ner_label) in pair_dict.items():
+                
+                if v2_ner_label=='NIL':
+                    continue
+                v1 = list(v1)
+                m1 = k1[0]
+                m2 = k1[1]
+                if m1 == m2:
+                    continue
+              
+                pred_label = np.argmax(v1)
+                if pred_label>0 and pred_label < num_label:
+
+                    pred_score = v1[pred_label]
+
+                    sentence_results.append( (pred_score, m1, m2, pred_label, None, v2_ner_label) )
+
+            sentence_results.sort(key=lambda x: -x[0])
+            no_overlap = []
+            def is_overlap(m1, m2):
+                if m2[0]<=m1[0] and m1[0]<=m2[1]:
+                    return True
+                if m1[0]<=m2[0] and m2[0]<=m1[1]:
+                    return True
+                return False
+
+            output_preds = []
+
+            for item in sentence_results:
+                m1 = item[1]
+                m2 = item[2]
+                overlap = False
+                for x in no_overlap:
+                    _m1 = x[1]
+                    _m2 = x[2]
+                    if item[3]==x[3] and (is_overlap(m1, _m1) and is_overlap(m2, _m2)):
+                        overlap = True
+                        break
+
+                pred_label = label_list[item[3]]
+
+                output_preds.append((m1, m2, pred_label))
+
+                if not overlap:
+                    no_overlap.append(item)
+
+            for item in no_overlap:
+                m1 = item[1]
+                m2 = item[2]
+                pred_rel_label = label_list[item[3]]
+                predict_rel[example_index].append( (m1[0], m1[1], m2[0], m2[1], pred_rel_label) )
+
+    predTime = timeit.default_timer() - start_time
+    logger.info("  Prediction done in total %f secs (%f example per second)", predTime,  len(global_predicted_ners) / predTime)
+
+    f = open(pred_dataset.file_path)
+    output_w = open(os.path.join(args.output_dir, 'rel_pred_test.json'), 'w')  
+    for l_idx, line in enumerate(f):
+        data = json.loads(line)
+        num_sents = len(data['sentences'])
+        predicted_rel = []
+        for n in range(num_sents):
+            item = predict_rel.get((l_idx, n), [])
+            item.sort()
+            predicted_rel.append( item )
+
+        data['predicted_rel'] = predicted_rel
+        output_w.write(json.dumps(data)+'\n')
+
+    return
 
 def main():
     parser = argparse.ArgumentParser()
@@ -1032,6 +1282,8 @@ def main():
                         help="Whether to run training.")
     parser.add_argument("--do_eval", action='store_true',
                         help="Whether to run eval on the dev set.")
+    parser.add_argument("--do_pred", action='store_true',
+                        help="Whether to run pred on the data")
 
     parser.add_argument("--evaluate_during_training", action='store_true',
                         help="Rul evaluation during training at each logging step.")
@@ -1315,6 +1567,27 @@ def main():
 
         output_eval_file = os.path.join(args.output_dir, "results.json")
         json.dump(results, open(output_eval_file, "w"))
+
+    # Prediction (no evaluation)
+    if args.do_pred:
+
+        checkpoints = [args.output_dir]
+
+        WEIGHTS_NAME = 'pytorch_model.bin'
+
+        if args.eval_all_checkpoints:
+            checkpoints = list(os.path.dirname(c) for c in sorted(glob.glob(args.output_dir + '/**/' + WEIGHTS_NAME, recursive=True)))
+
+        logger.info("Predict using the following checkpoints: %s", checkpoints)
+        for checkpoint in checkpoints:
+            global_step = checkpoint.split('-')[-1] if len(checkpoints) > 1 else ""
+
+            model = model_class.from_pretrained(checkpoint, config=config)
+
+            model.to(args.device)
+            predict(args, model, tokenizer, prefix=global_step)
+
+
 
 
 if __name__ == "__main__":
